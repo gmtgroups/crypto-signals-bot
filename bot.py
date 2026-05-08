@@ -1,764 +1,699 @@
 """
-╔══════════════════════════════════════════════════════╗
-║         CRYPTO SIGNALS BOT — Full Production         ║
-║   Price alerts · trending tokens · whale moves       ║
-║   Free: top 5 coins | Premium: full signals suite    ║
-╚══════════════════════════════════════════════════════╝
-
-SETUP (one-time, ~20 min):
-1. Message @BotFather on Telegram → /newbot → copy TOKEN
-2. Sign up at railway.app (free tier)
-3. Set environment variables (see .env.example)
-4. Deploy — bot runs forever, fully automated.
-
-DATA SOURCES (all free APIs):
-- CoinGecko: prices, market cap, trending
-- CryptoCompare: news feed
-- Alternative.me: Fear & Greed Index
-- Whale Alert public API (optional, needs free key)
+Crypto Signals Pro Bot - v2
+Features:
+- 3 tiers: Free / Premium (200 Stars) / Premium+ (500 Stars)
+- Live prices from CoinGecko (free, no key needed)
+- Fear & Greed Index
+- Trending coins + crypto news
+- Price move alerts (5% free / 2% premium / 0.5% premium+)
+- Whale alerts ($1M+ premium / $100K+ premium+)
+- Portfolio tracker, AI market analysis, DeFi yields, VIP signals (Premium+)
+- /admin dashboard
+- Referral system (7 free premium days per referral)
 """
 
 import os
-import asyncio
 import logging
 import sqlite3
-import httpx
+import json
+import asyncio
+import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
+
+import httpx
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
-    PreCheckoutQueryHandler, MessageHandler, filters,
-    ContextTypes
+    MessageHandler, PreCheckoutQueryHandler, filters, ContextTypes
 )
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
-# ── Logging ───────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
-    level=logging.INFO
+    level=logging.INFO,
 )
 log = logging.getLogger(__name__)
 
-# ── Config ────────────────────────────────────────────
-BOT_TOKEN            = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-WHALE_ALERT_API_KEY  = os.getenv("WHALE_ALERT_KEY", "")       # Free at whale-alert.io
-ADMIN_IDS            = [int(x) for x in os.getenv("ADMIN_IDS", "0").split(",")]
+# ── Environment ───────────────────────────────────────────────────────────────
+BOT_TOKEN        = os.environ["BOT_TOKEN"]
+ADMIN_IDS        = [int(x) for x in os.environ.get("ADMIN_IDS", "0").split(",") if x]
+WHALE_ALERT_KEY  = os.environ.get("WHALE_ALERT_KEY", "")
+CHANNEL_USERNAME = os.environ.get("CHANNEL_USERNAME", "")   # e.g. @cryptosignalsdaily
 
-PREMIUM_PRICE_STARS  = 500           # ~$6.25 USD / month
-PREMIUM_DAYS         = 30
+# ── Pricing ───────────────────────────────────────────────────────────────────
+PREMIUM_STARS      = 200
+PREMIUM_PLUS_STARS = 500
 
-DB_PATH = "crypto_signals.db"
+# ── Alert thresholds ──────────────────────────────────────────────────────────
+ALERT_FREE         = 5.0    # %
+ALERT_PREMIUM      = 2.0    # %
+ALERT_PREMIUM_PLUS = 0.5    # %
+WHALE_PREMIUM      = 1_000_000   # USD
+WHALE_PREMIUM_PLUS = 100_000     # USD
 
-# ── API Endpoints ─────────────────────────────────────
-COINGECKO_BASE    = "https://api.coingecko.com/api/v3"
-FEAR_GREED_API    = "https://api.alternative.me/fng/"
-CRYPTOCOMPARE_NEWS= "https://min-api.cryptocompare.com/data/v2/news/?lang=EN&categories=BTC,ETH,Altcoin,Trading"
-WHALE_ALERT_API   = "https://api.whale-alert.io/v1/transactions"
-
-# Top coins to track
-TOP_COINS = [
-    "bitcoin", "ethereum", "solana", "binancecoin",
-    "ripple", "cardano", "avalanche-2", "polkadot",
-    "chainlink", "dogecoin", "shiba-inu", "pepe"
+# ── Coin lists ────────────────────────────────────────────────────────────────
+FREE_COINS    = ["bitcoin", "ethereum", "solana", "bnb", "xrp"]
+PREMIUM_COINS = FREE_COINS + [
+    "cardano", "dogecoin", "tron", "avalanche-2", "chainlink",
+    "polygon", "litecoin", "polkadot", "shiba-inu", "dai",
 ]
 
-# Alert thresholds
-PRICE_CHANGE_THRESHOLD_FREE    = 5.0   # % — free users get alerted at 5%
-PRICE_CHANGE_THRESHOLD_PREMIUM = 2.0   # % — premium users get alerted at 2%
-WHALE_THRESHOLD_USD            = 1_000_000  # $1M+ transactions
+# ─────────────────────────────────────────────────────────────────────────────
+# DATABASE
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Database ──────────────────────────────────────────
+def get_db():
+    db = sqlite3.connect("crypto.db", check_same_thread=False)
+    db.row_factory = sqlite3.Row
+    return db
+
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id         INTEGER PRIMARY KEY,
-            username        TEXT,
-            first_name      TEXT,
-            is_premium      INTEGER DEFAULT 0,
-            premium_until   TEXT,
-            watchlist       TEXT DEFAULT '',
-            alert_threshold REAL DEFAULT 5.0,
-            joined_at       TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS price_cache (
-            coin_id     TEXT PRIMARY KEY,
-            price_usd   REAL,
-            change_24h  REAL,
-            market_cap  REAL,
-            volume_24h  REAL,
-            updated_at  TEXT
-        );
-        CREATE TABLE IF NOT EXISTS alerts_sent (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            coin_id     TEXT,
-            direction   TEXT,
-            sent_at     TEXT DEFAULT (datetime('now'))
-        );
-        CREATE TABLE IF NOT EXISTS payments (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            amount      INTEGER,
-            currency    TEXT,
-            paid_at     TEXT DEFAULT (datetime('now'))
-        );
+    db = get_db()
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users (
+        user_id       INTEGER PRIMARY KEY,
+        username      TEXT,
+        first_name    TEXT,
+        tier          TEXT DEFAULT 'free',
+        tier_until    TEXT,
+        stars_spent   INTEGER DEFAULT 0,
+        referral_code TEXT UNIQUE,
+        referred_by   INTEGER,
+        joined_at     TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS referrals (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        created_at  TEXT DEFAULT (datetime('now'))
+    );
+
+    CREATE TABLE IF NOT EXISTS portfolios (
+        id       INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id  INTEGER,
+        coin_id  TEXT,
+        amount   REAL
+    );
+
+    CREATE TABLE IF NOT EXISTS price_cache (
+        coin_id    TEXT PRIMARY KEY,
+        price_usd  REAL,
+        change_24h REAL,
+        updated_at TEXT
+    );
     """)
-    conn.commit()
-    conn.close()
+    db.commit()
+    db.close()
 
-def get_user(user_id: int) -> Optional[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    row = c.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+# ─────────────────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def upsert_user(user_id: int, username: str, first_name: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO users (user_id, username, first_name)
-        VALUES (?,?,?)
-        ON CONFLICT(user_id) DO UPDATE SET
-            username=excluded.username,
-            first_name=excluded.first_name
-    """, (user_id, username, first_name))
-    conn.commit()
-    conn.close()
+def make_referral_code(user_id: int) -> str:
+    return hashlib.md5(f"crypto_{user_id}".encode()).hexdigest()[:8].upper()
 
-def set_premium(user_id: int, days: int = PREMIUM_DAYS):
-    until = (datetime.now() + timedelta(days=days)).isoformat()
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET is_premium=1, premium_until=?, alert_threshold=? WHERE user_id=?",
-              (until, PRICE_CHANGE_THRESHOLD_PREMIUM, user_id))
-    conn.commit()
-    conn.close()
+def get_or_create_user(user_id: int, username: str = "", first_name: str = "") -> sqlite3.Row:
+    db = get_db()
+    row = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    if not row:
+        code = make_referral_code(user_id)
+        db.execute(
+            "INSERT INTO users (user_id, username, first_name, referral_code) VALUES (?,?,?,?)",
+            (user_id, username, first_name, code)
+        )
+        db.commit()
+        row = db.execute("SELECT * FROM users WHERE user_id=?", (user_id,)).fetchone()
+    db.close()
+    return row
 
-def is_premium(user_id: int) -> bool:
-    user = get_user(user_id)
-    if not user or not user["is_premium"]:
-        return False
-    if user["premium_until"]:
-        return datetime.fromisoformat(user["premium_until"]) > datetime.now()
-    return False
+def user_tier(user_id: int) -> str:
+    db = get_db()
+    row = db.execute("SELECT tier, tier_until FROM users WHERE user_id=?", (user_id,)).fetchone()
+    db.close()
+    if not row:
+        return "free"
+    if row["tier"] in ("premium", "premium_plus"):
+        if row["tier_until"] and datetime.fromisoformat(row["tier_until"]) < datetime.utcnow():
+            db2 = get_db()
+            db2.execute("UPDATE users SET tier='free', tier_until=NULL WHERE user_id=?", (user_id,))
+            db2.commit()
+            db2.close()
+            return "free"
+        return row["tier"]
+    return "free"
 
-def get_watchlist(user_id: int) -> list[str]:
-    user = get_user(user_id)
-    if not user or not user["watchlist"]:
-        return TOP_COINS[:5]
-    return [c for c in user["watchlist"].split(",") if c]
+def grant_premium(user_id: int, tier: str, days: int):
+    db = get_db()
+    row = db.execute("SELECT tier_until FROM users WHERE user_id=?", (user_id,)).fetchone()
+    now = datetime.utcnow()
+    base = max(datetime.fromisoformat(row["tier_until"]), now) if row and row["tier_until"] else now
+    until = (base + timedelta(days=days)).isoformat()
+    db.execute("UPDATE users SET tier=?, tier_until=? WHERE user_id=?", (tier, until, user_id))
+    db.commit()
+    db.close()
 
-def set_watchlist(user_id: int, coins: list[str]):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("UPDATE users SET watchlist=? WHERE user_id=?", (",".join(coins), user_id))
-    conn.commit()
-    conn.close()
+def handle_referral(new_user_id: int, code: str) -> Optional[int]:
+    db = get_db()
+    referrer = db.execute("SELECT user_id FROM users WHERE referral_code=?", (code,)).fetchone()
+    if referrer and referrer["user_id"] != new_user_id:
+        already = db.execute("SELECT id FROM referrals WHERE referred_id=?", (new_user_id,)).fetchone()
+        if not already:
+            db.execute(
+                "INSERT INTO referrals (referrer_id, referred_id) VALUES (?,?)",
+                (referrer["user_id"], new_user_id)
+            )
+            db.execute("UPDATE users SET referred_by=? WHERE user_id=?", (referrer["user_id"], new_user_id))
+            db.commit()
+            db.close()
+            return referrer["user_id"]
+    db.close()
+    return None
 
-def get_all_users() -> list:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    rows = c.execute("SELECT user_id, is_premium, alert_threshold FROM users").fetchall()
-    conn.close()
-    return rows
+# ─────────────────────────────────────────────────────────────────────────────
+# COINGECKO API
+# ─────────────────────────────────────────────────────────────────────────────
 
-def log_payment(user_id: int, amount: int, currency: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO payments (user_id, amount, currency) VALUES (?,?,?)", (user_id, amount, currency))
-    conn.commit()
-    conn.close()
-
-def alert_already_sent(user_id: int, coin_id: str, direction: str) -> bool:
-    """Prevent duplicate alerts within 1 hour."""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    cutoff = (datetime.now() - timedelta(hours=1)).isoformat()
-    row = c.execute("""
-        SELECT 1 FROM alerts_sent
-        WHERE user_id=? AND coin_id=? AND direction=? AND sent_at > ?
-    """, (user_id, coin_id, direction, cutoff)).fetchone()
-    conn.close()
-    return row is not None
-
-def log_alert(user_id: int, coin_id: str, direction: str):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("INSERT INTO alerts_sent (user_id, coin_id, direction) VALUES (?,?,?)",
-              (user_id, coin_id, direction))
-    conn.commit()
-    conn.close()
-
-# ── Data Fetchers ─────────────────────────────────────
-async def fetch_prices(coin_ids: list[str]) -> dict:
-    """Fetch prices from CoinGecko (free API)."""
+async def get_prices(coin_ids: list[str]) -> dict:
     ids = ",".join(coin_ids)
-    url = (
-        f"{COINGECKO_BASE}/coins/markets"
-        f"?vs_currency=usd&ids={ids}"
-        f"&order=market_cap_desc&per_page=50&page=1"
-        f"&sparkline=false&price_change_percentage=1h,24h,7d"
-    )
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={ids}&vs_currencies=usd&include_24hr_change=true"
     try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.get(url)
-            data = resp.json()
-            result = {}
-            for coin in data:
-                result[coin["id"]] = {
-                    "name":       coin["name"],
-                    "symbol":     coin["symbol"].upper(),
-                    "price":      coin["current_price"],
-                    "change_1h":  coin.get("price_change_percentage_1h_in_currency", 0) or 0,
-                    "change_24h": coin.get("price_change_percentage_24h", 0) or 0,
-                    "change_7d":  coin.get("price_change_percentage_7d_in_currency", 0) or 0,
-                    "market_cap": coin.get("market_cap", 0) or 0,
-                    "volume":     coin.get("total_volume", 0) or 0,
-                    "ath":        coin.get("ath", 0) or 0,
-                    "ath_change": coin.get("ath_change_percentage", 0) or 0,
-                }
-            return result
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(url)
+            data = r.json()
+            # Cache prices
+            db = get_db()
+            for cid, vals in data.items():
+                db.execute(
+                    "INSERT OR REPLACE INTO price_cache (coin_id, price_usd, change_24h, updated_at) VALUES (?,?,?,?)",
+                    (cid, vals.get("usd", 0), vals.get("usd_24h_change", 0), datetime.utcnow().isoformat())
+                )
+            db.commit()
+            db.close()
+            return data
     except Exception as e:
-        log.error(f"CoinGecko error: {e}")
+        log.warning(f"CoinGecko price error: {e}")
         return {}
 
-async def fetch_fear_greed() -> dict:
-    """Fetch Fear & Greed Index."""
+async def get_fear_greed() -> str:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(FEAR_GREED_API)
-            data = resp.json()
-            fg = data["data"][0]
-            return {
-                "value":       int(fg["value"]),
-                "label":       fg["value_classification"],
-                "timestamp":   fg["timestamp"],
-            }
-    except Exception as e:
-        log.error(f"Fear/Greed error: {e}")
-        return {"value": 50, "label": "Neutral", "timestamp": ""}
+            r = await client.get("https://api.alternative.me/fng/?limit=1")
+            d = r.json()["data"][0]
+            return f"{d['value']} — {d['value_classification']}"
+    except Exception:
+        return "Unavailable"
 
-async def fetch_trending() -> list[dict]:
-    """Fetch trending coins from CoinGecko."""
+async def get_trending_coins() -> list[str]:
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(f"{COINGECKO_BASE}/search/trending")
-            data = resp.json()
-            return [
-                {
-                    "name":   c["item"]["name"],
-                    "symbol": c["item"]["symbol"],
-                    "rank":   c["item"]["market_cap_rank"],
-                }
-                for c in data.get("coins", [])[:7]
-            ]
-    except Exception as e:
-        log.error(f"Trending error: {e}")
+            r = await client.get("https://api.coingecko.com/api/v3/search/trending")
+            coins = r.json().get("coins", [])
+            return [c["item"]["name"] for c in coins[:5]]
+    except Exception:
         return []
 
-async def fetch_crypto_news() -> list[dict]:
-    """Fetch latest crypto news."""
+async def get_whale_alerts(min_usd: int) -> list[dict]:
+    if not WHALE_ALERT_KEY:
+        return []
     try:
+        url = f"https://api.whale-alert.io/v1/transactions?api_key={WHALE_ALERT_KEY}&min_value={min_usd}&limit=5"
         async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(CRYPTOCOMPARE_NEWS)
-            data = resp.json()
-            articles = []
-            for item in data.get("Data", [])[:8]:
-                articles.append({
-                    "title":  item["title"],
-                    "url":    item["url"],
-                    "source": item["source"],
-                    "body":   item["body"][:200],
-                })
-            return articles
+            r = await client.get(url)
+            txs = r.json().get("transactions", [])
+            return txs
     except Exception as e:
-        log.error(f"Crypto news error: {e}")
+        log.warning(f"Whale alert error: {e}")
         return []
 
-# ── Message Builders ──────────────────────────────────
-def emoji_for_change(pct: float) -> str:
-    if pct >= 10:  return "🚀"
-    if pct >= 5:   return "📈"
-    if pct >= 0:   return "🟢"
-    if pct >= -5:  return "🔴"
-    if pct >= -10: return "📉"
-    return "💀"
+# ─────────────────────────────────────────────────────────────────────────────
+# KEYBOARDS
+# ─────────────────────────────────────────────────────────────────────────────
 
-def format_price(price: float) -> str:
-    if price >= 1000: return f"${price:,.2f}"
-    if price >= 1:    return f"${price:.4f}"
-    return f"${price:.8f}"
+def main_menu(tier: str) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton("📈 Live Prices",    callback_data="prices"),
+            InlineKeyboardButton("😱 Fear & Greed",   callback_data="fear"),
+        ],
+        [
+            InlineKeyboardButton("🔥 Trending",       callback_data="trending"),
+            InlineKeyboardButton("🐋 Whale Alerts",   callback_data="whales"),
+        ],
+    ]
+    if tier == "free":
+        rows.append([InlineKeyboardButton("⭐ Upgrade to Premium", callback_data="upgrade")])
+    elif tier == "premium":
+        rows.append([InlineKeyboardButton("💎 Upgrade to Premium+", callback_data="upgrade_plus")])
+    else:
+        rows.append([InlineKeyboardButton("💼 My Portfolio", callback_data="portfolio")])
 
-def format_large(n: float) -> str:
-    if n >= 1e9:  return f"${n/1e9:.2f}B"
-    if n >= 1e6:  return f"${n/1e6:.2f}M"
-    return f"${n:,.0f}"
+    rows.append([
+        InlineKeyboardButton("👥 Refer a Friend", callback_data="referral"),
+        InlineKeyboardButton("⚙️ My Account",     callback_data="account"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
-def build_price_card(coin_id: str, data: dict) -> str:
-    e = emoji_for_change(data["change_24h"])
-    return (
-        f"{e} *{data['name']} ({data['symbol']})*\n"
-        f"💵 Price: {format_price(data['price'])}\n"
-        f"⏱ 1h: {data['change_1h']:+.2f}%  "
-        f"📅 24h: {data['change_24h']:+.2f}%  "
-        f"📆 7d: {data['change_7d']:+.2f}%\n"
-        f"📊 Vol: {format_large(data['volume'])}  "
-        f"Mktcap: {format_large(data['market_cap'])}\n"
-    )
-
-def build_fear_greed_bar(value: int) -> str:
-    filled = round(value / 10)
-    bar = "█" * filled + "░" * (10 - filled)
-    if value >= 75:   label = "🤑 Extreme Greed"
-    elif value >= 55: label = "😊 Greed"
-    elif value >= 45: label = "😐 Neutral"
-    elif value >= 25: label = "😨 Fear"
-    else:             label = "😱 Extreme Fear"
-    return f"[{bar}] {value}/100 — {label}"
-
-# ── Keyboards ─────────────────────────────────────────
-def premium_keyboard():
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("⭐ Upgrade to Premium", callback_data="buy_premium")
-    ]])
-
-def main_menu_keyboard(premium: bool = False):
+def upgrade_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📊 Price Check",     callback_data="prices"),
-         InlineKeyboardButton("🔥 Trending",        callback_data="trending")],
-        [InlineKeyboardButton("😱 Fear & Greed",    callback_data="fear_greed"),
-         InlineKeyboardButton("📰 Crypto News",     callback_data="news")],
-        [InlineKeyboardButton("🔔 My Alerts",       callback_data="my_alerts"),
-         InlineKeyboardButton("📋 My Watchlist",    callback_data="watchlist")],
-        [] if premium else [InlineKeyboardButton("⭐ Premium — 500 Stars/mo", callback_data="buy_premium")],
+        [InlineKeyboardButton(f"⭐ Premium — {PREMIUM_STARS} Stars/mo",      callback_data="buy_premium")],
+        [InlineKeyboardButton(f"💎 Premium+ — {PREMIUM_PLUS_STARS} Stars/mo", callback_data="buy_premium_plus")],
+        [InlineKeyboardButton("◀️ Back", callback_data="back")],
     ])
 
-# ── Command Handlers ──────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# COMMAND HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    upsert_user(user.id, user.username or "", user.first_name or "")
-    premium = is_premium(user.id)
+    args = ctx.args or []
 
-    fg = await fetch_fear_greed()
-    bar = build_fear_greed_bar(fg["value"])
+    get_or_create_user(user.id, user.username or "", user.first_name or "")
 
+    referrer_id = None
+    if args and args[0].startswith("ref_"):
+        code = args[0][4:]
+        referrer_id = handle_referral(user.id, code)
+
+    if referrer_id:
+        grant_premium(user.id, "premium", 3)
+        grant_premium(referrer_id, "premium", 7)
+        try:
+            await ctx.bot.send_message(
+                referrer_id,
+                "🎉 Someone joined via your referral! You earned 7 free Premium days!"
+            )
+        except Exception:
+            pass
+        await update.message.reply_text(
+            "🎉 Welcome! You've been given 3 free Premium days as a referral bonus!"
+        )
+
+    tier = user_tier(user.id)
     welcome = (
-        f"🚨 *Welcome, {user.first_name}!*\n\n"
-        f"I'm your *Crypto Signals Bot* — I track prices, whale moves, trending tokens and market sentiment 24/7.\n\n"
-        f"📊 *Market Mood Right Now:*\n{bar}\n\n"
-        f"🆓 *Free:* Top 5 coins · Daily digest · 5% move alerts\n"
-        f"⭐ *Premium (500 Stars/mo):* All coins · Whale alerts · 2% alerts · Real-time signals\n\n"
-        f"What do you want to check?"
+        f"👋 Welcome to *Crypto Signals Pro*, {user.first_name}!\n\n"
+        f"📈 Real-time crypto prices, alerts & whale tracking.\n\n"
+        f"*Your tier:* {'💎 Premium+' if tier=='premium_plus' else '⭐ Premium' if tier=='premium' else '🆓 Free'}\n\n"
+        f"🆓 Free: Top 5 coins, 5% move alerts\n"
+        f"⭐ Premium: All coins, 2% alerts, whale alerts $1M+\n"
+        f"💎 Premium+: 0.5% alerts, whale $100K+, portfolio, AI analysis"
     )
-    await update.message.reply_text(
-        welcome, parse_mode="Markdown",
-        reply_markup=main_menu_keyboard(premium)
-    )
-
-async def cmd_price(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    """Get prices for watchlist coins."""
-    user_id = update.effective_user.id
-    premium = is_premium(user_id)
-    watchlist = get_watchlist(user_id) if premium else TOP_COINS[:5]
-
-    await update.message.reply_text("⏳ Fetching live prices...")
-    prices = await fetch_prices(watchlist)
-
-    if not prices:
-        await update.message.reply_text("⚠️ Price data unavailable. Try again shortly.")
-        return
-
-    msg = f"📊 *Live Prices — {datetime.utcnow().strftime('%H:%M UTC')}*\n\n"
-    for coin_id, data in prices.items():
-        msg += build_price_card(coin_id, data) + "\n"
-
-    if not premium:
-        msg += "\n⭐ *Premium:* Track all coins + get 2% move alerts!"
-
-    await update.message.reply_text(
-        msg, parse_mode="Markdown",
-        reply_markup=None if premium else premium_keyboard()
-    )
-
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    user = get_user(user_id)
-    premium = is_premium(user_id)
-    until = (user or {}).get("premium_until", "N/A")
-
-    await update.message.reply_text(
-        f"📋 *Your Status*\n\n"
-        f"🏷 Tier: {'⭐ Premium' if premium else '🆓 Free'}\n"
-        + (f"📅 Until: {until[:10]}\n" if premium and until else "")
-        + f"🔔 Alert threshold: {PRICE_CHANGE_THRESHOLD_PREMIUM if premium else PRICE_CHANGE_THRESHOLD_FREE}%\n"
-        f"📋 Watchlist: {len(get_watchlist(user_id))} coins",
-        parse_mode="Markdown",
-        reply_markup=None if premium else premium_keyboard()
-    )
+    await update.message.reply_text(welcome, parse_mode="Markdown", reply_markup=main_menu(tier))
 
 async def cmd_admin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id not in ADMIN_IDS:
         return
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    total   = c.execute("SELECT COUNT(*) FROM users").fetchone()[0]
-    premium = c.execute("SELECT COUNT(*) FROM users WHERE is_premium=1").fetchone()[0]
-    revenue = c.execute("SELECT SUM(amount) FROM payments").fetchone()[0] or 0
-    alerts  = c.execute("SELECT COUNT(*) FROM alerts_sent WHERE sent_at > datetime('now','-24 hours')").fetchone()[0]
-    conn.close()
-
+    db = get_db()
+    total   = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    premium = db.execute("SELECT COUNT(*) FROM users WHERE tier='premium'").fetchone()[0]
+    plus    = db.execute("SELECT COUNT(*) FROM users WHERE tier='premium_plus'").fetchone()[0]
+    stars   = db.execute("SELECT COALESCE(SUM(stars_spent),0) FROM users").fetchone()[0]
+    refs    = db.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+    db.close()
+    usd = round(stars * 0.0125, 2)
     await update.message.reply_text(
-        f"📊 *Admin Dashboard*\n\n"
+        f"📊 *Crypto Bot Admin*\n\n"
         f"👥 Total users: {total}\n"
         f"⭐ Premium: {premium}\n"
-        f"💰 Stars earned: {revenue}\n"
-        f"🔔 Alerts sent (24h): {alerts}\n"
-        f"📈 Conversion: {round(premium/max(total,1)*100,1)}%",
+        f"💎 Premium+: {plus}\n"
+        f"🆓 Free: {total - premium - plus}\n\n"
+        f"⭐ Stars earned: {stars} (~${usd})\n"
+        f"👥 Referrals: {refs}",
         parse_mode="Markdown"
     )
 
-# ── Callback Handlers ─────────────────────────────────
-async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    premium = is_premium(user_id)
-    data = query.data
+async def cmd_portfolio(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if user_tier(uid) != "premium_plus":
+        await update.message.reply_text("💎 Portfolio tracking is a Premium+ feature.")
+        return
+    if not ctx.args or len(ctx.args) != 2:
+        await update.message.reply_text("Usage: /portfolio <coin> <amount>\nExample: /portfolio bitcoin 0.5")
+        return
+    coin, amount = ctx.args[0].lower(), ctx.args[1]
+    try:
+        amount = float(amount)
+    except ValueError:
+        await update.message.reply_text("Amount must be a number.")
+        return
+    db = get_db()
+    db.execute(
+        "INSERT OR REPLACE INTO portfolios (user_id, coin_id, amount) VALUES (?,?,?)",
+        (uid, coin, amount)
+    )
+    db.commit()
+    db.close()
+    await update.message.reply_text(f"✅ Portfolio updated: {amount} {coin.upper()}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CALLBACK HANDLERS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def on_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    q    = update.callback_query
+    data = q.data
+    uid  = q.from_user.id
+    tier = user_tier(uid)
+    await q.answer()
 
     if data == "prices":
-        watchlist = get_watchlist(user_id) if premium else TOP_COINS[:5]
-        await query.message.reply_text("⏳ Fetching prices...")
-        prices = await fetch_prices(watchlist)
-        msg = f"📊 *Live Prices — {datetime.utcnow().strftime('%H:%M UTC')}*\n\n"
-        for _, coin_data in prices.items():
-            msg += build_price_card(_, coin_data) + "\n"
-        if not premium:
-            msg += "\n⭐ *Premium:* All coins + 2% move alerts!"
-        await query.message.reply_text(msg, parse_mode="Markdown",
-                                       reply_markup=None if premium else premium_keyboard())
+        coins = PREMIUM_COINS if tier in ("premium", "premium_plus") else FREE_COINS
+        await q.message.reply_text("⏳ Fetching live prices…")
+        prices = await get_prices(coins)
+        if not prices:
+            await q.message.reply_text("⚠️ Price data unavailable right now.")
+            return
+        lines = []
+        for cid, vals in prices.items():
+            price  = vals.get("usd", 0)
+            change = vals.get("usd_24h_change", 0)
+            arrow  = "🟢" if change >= 0 else "🔴"
+            lines.append(f"{arrow} *{cid.upper()}*: ${price:,.4f} ({change:+.2f}%)")
+        await q.message.reply_text(
+            "📈 *Live Crypto Prices*\n\n" + "\n".join(lines),
+            parse_mode="Markdown"
+        )
+
+    elif data == "fear":
+        fg = await get_fear_greed()
+        await q.message.reply_text(f"😱 *Fear & Greed Index*\n\n{fg}", parse_mode="Markdown")
 
     elif data == "trending":
-        trending = await fetch_trending()
-        if not trending:
-            await query.message.reply_text("⚠️ Trending data unavailable.")
+        coins = await get_trending_coins()
+        if coins:
+            msg = "🔥 *Trending Coins Right Now*\n\n" + "\n".join(f"• {c}" for c in coins)
+        else:
+            msg = "⚠️ Trending data unavailable."
+        await q.message.reply_text(msg, parse_mode="Markdown")
+
+    elif data == "whales":
+        if tier == "free":
+            await q.message.reply_text("⭐ Whale alerts require Premium. Upgrade to unlock!")
             return
-        msg = "🔥 *Trending Coins Right Now*\n\n"
-        for i, c in enumerate(trending, 1):
-            rank = f"#{c['rank']}" if c['rank'] else "unranked"
-            msg += f"{i}. *{c['name']}* ({c['symbol']}) — Market cap rank {rank}\n"
-        if not premium:
-            msg += "\n⭐ Premium: Set alerts on trending coins instantly!"
-        await query.message.reply_text(msg, parse_mode="Markdown",
-                                       reply_markup=None if premium else premium_keyboard())
-
-    elif data == "fear_greed":
-        fg = await fetch_fear_greed()
-        bar = build_fear_greed_bar(fg["value"])
-        interpretation = {
-            range(0, 25):   "🔑 *Buying opportunity?* Extreme fear often precedes reversals.",
-            range(25, 45):  "😨 Market is fearful. Proceed cautiously.",
-            range(45, 55):  "😐 Neutral sentiment. Watch for a directional move.",
-            range(55, 75):  "😊 Greed building. Consider taking some profits.",
-            range(75, 101): "⚠️ *Extreme greed.* Historically a correction risk zone.",
-        }
-        tip = next((v for k, v in interpretation.items() if fg["value"] in k), "")
-        msg = (
-            f"😱 *Fear & Greed Index*\n\n"
-            f"{bar}\n\n"
-            f"{tip}\n\n"
-            f"_Updated daily — reflects market sentiment from volatility, momentum, social media, surveys, and dominance._"
-        )
-        await query.message.reply_text(msg, parse_mode="Markdown")
-
-    elif data == "news":
-        articles = await fetch_crypto_news()
-        if not articles:
-            await query.message.reply_text("⚠️ News unavailable right now.")
+        min_usd = WHALE_PREMIUM_PLUS if tier == "premium_plus" else WHALE_PREMIUM
+        txs = await get_whale_alerts(min_usd)
+        if not txs:
+            await q.message.reply_text("🐋 No recent whale transactions found.")
             return
-        limit = len(articles) if premium else 3
-        msg = "📰 *Latest Crypto News*\n\n"
-        for art in articles[:limit]:
-            msg += f"• [{art['title']}]({art['url']}) — _{art['source']}_\n\n"
-        if not premium:
-            msg += "⭐ *Premium:* Full news feed + real-time breaking alerts!"
-        await query.message.reply_text(msg, parse_mode="Markdown",
-                                       disable_web_page_preview=True,
-                                       reply_markup=None if premium else premium_keyboard())
-
-    elif data == "my_alerts":
-        threshold = PRICE_CHANGE_THRESHOLD_PREMIUM if premium else PRICE_CHANGE_THRESHOLD_FREE
-        msg = (
-            f"🔔 *Your Alert Settings*\n\n"
-            f"Trigger: price moves ≥ {threshold}% in 1 hour\n"
-            f"Coins watched: {len(get_watchlist(user_id))}\n\n"
-            + ("✅ Alerts are active and running 24/7." if premium
-               else "⭐ Upgrade to Premium for 2% alerts on all coins!")
+        lines = []
+        for tx in txs[:5]:
+            amt  = tx.get("amount_usd", 0)
+            sym  = tx.get("symbol", "?").upper()
+            from_ = tx.get("from", {}).get("owner", "unknown")
+            to_   = tx.get("to",   {}).get("owner", "unknown")
+            lines.append(f"🐋 ${amt:,.0f} {sym}\n   {from_} → {to_}")
+        await q.message.reply_text(
+            f"🐋 *Whale Alerts (>${min_usd:,})*\n\n" + "\n\n".join(lines),
+            parse_mode="Markdown"
         )
-        await query.message.reply_text(msg, parse_mode="Markdown",
-                                       reply_markup=None if premium else premium_keyboard())
 
-    elif data == "watchlist":
-        coins = get_watchlist(user_id)
-        msg = (
-            f"📋 *Your Watchlist*\n\n"
-            + "\n".join(f"• {c}" for c in coins)
-            + ("\n\n⭐ *Premium:* Customise with any coin!" if not premium else
-               "\n\n_Reply /watch <coin_id> to add a coin (e.g. /watch pepe)_")
+    elif data == "portfolio":
+        if tier != "premium_plus":
+            await q.message.reply_text("💎 Portfolio requires Premium+.")
+            return
+        db = get_db()
+        holdings = db.execute("SELECT coin_id, amount FROM portfolios WHERE user_id=?", (uid,)).fetchall()
+        db.close()
+        if not holdings:
+            await q.message.reply_text(
+                "💼 No portfolio yet.\nAdd holdings with /portfolio <coin> <amount>\nExample: /portfolio bitcoin 0.5"
+            )
+            return
+        coin_ids = [h["coin_id"] for h in holdings]
+        prices   = await get_prices(coin_ids)
+        total_usd = 0.0
+        lines = []
+        for h in holdings:
+            cid   = h["coin_id"]
+            amt   = h["amount"]
+            price = prices.get(cid, {}).get("usd", 0)
+            val   = amt * price
+            total_usd += val
+            lines.append(f"• {amt} {cid.upper()} = ${val:,.2f}")
+        await q.message.reply_text(
+            "💼 *Your Portfolio*\n\n" + "\n".join(lines) +
+            f"\n\n💰 Total: *${total_usd:,.2f}*",
+            parse_mode="Markdown"
         )
-        await query.message.reply_text(msg, parse_mode="Markdown",
-                                       reply_markup=None if premium else premium_keyboard())
 
-    elif data == "about_premium":
-        await query.message.reply_text(
-            "⭐ *Premium Features*\n\n"
-            "✅ 2% price move alerts (vs 5% free)\n"
-            "✅ All coins tracked (vs top 5)\n"
-            "✅ Whale transaction alerts ($1M+)\n"
-            "✅ Real-time signals every hour\n"
-            "✅ Full crypto news feed\n"
-            "✅ Custom watchlist\n"
-            "✅ Fear & Greed history\n\n"
-            "*Only 500 Telegram Stars/month* (~$6.25)",
-            parse_mode="Markdown",
-            reply_markup=premium_keyboard()
-        )
+    elif data == "upgrade":
+        await q.message.reply_text("Choose your plan:", reply_markup=upgrade_keyboard())
+
+    elif data == "upgrade_plus":
+        await q.message.reply_text("Upgrade to Premium+:", reply_markup=upgrade_keyboard())
 
     elif data == "buy_premium":
         await ctx.bot.send_invoice(
-            chat_id=user_id,
-            title="⭐ Crypto Signals Premium — 30 Days",
-            description="2% move alerts · whale tracking · all coins · real-time signals",
-            payload="crypto_premium_30d",
+            chat_id=uid,
+            title="Crypto Signals Premium",
+            description="All coins, 2% move alerts, whale alerts $1M+ — 30 days",
+            payload="premium_30",
             currency="XTR",
-            prices=[LabeledPrice("Premium 30 days", PREMIUM_PRICE_STARS)],
-            provider_token="",
+            prices=[LabeledPrice("Premium 30 days", PREMIUM_STARS)],
         )
 
-    elif data == "status":
-        await cmd_status(update, ctx)
-
-# ── Watchlist Command ─────────────────────────────────
-async def cmd_watch(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if not is_premium(user_id):
-        await update.message.reply_text(
-            "⭐ Custom watchlists are a Premium feature.",
-            reply_markup=premium_keyboard()
+    elif data == "buy_premium_plus":
+        await ctx.bot.send_invoice(
+            chat_id=uid,
+            title="Crypto Signals Premium+",
+            description="0.5% alerts, whale $100K+, portfolio, AI analysis — 30 days",
+            payload="premium_plus_30",
+            currency="XTR",
+            prices=[LabeledPrice("Premium+ 30 days", PREMIUM_PLUS_STARS)],
         )
-        return
-    if not ctx.args:
-        await update.message.reply_text("Usage: /watch <coin_id>\nExample: /watch pepe")
-        return
-    coin = ctx.args[0].lower()
-    # Validate coin exists
-    prices = await fetch_prices([coin])
-    if not prices:
-        await update.message.reply_text(f"❌ Coin '{coin}' not found on CoinGecko. Check the ID.")
-        return
-    watchlist = get_watchlist(user_id)
-    if coin not in watchlist:
-        watchlist.append(coin)
-        set_watchlist(user_id, watchlist)
-    await update.message.reply_text(f"✅ Added *{coin}* to your watchlist!", parse_mode="Markdown")
 
-# ── Payment Handlers ──────────────────────────────────
-async def pre_checkout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    elif data == "referral":
+        db = get_db()
+        row = db.execute("SELECT referral_code FROM users WHERE user_id=?", (uid,)).fetchone()
+        db.close()
+        code = row["referral_code"] if row else make_referral_code(uid)
+        bot_info = await ctx.bot.get_me()
+        link = f"https://t.me/{bot_info.username}?start=ref_{code}"
+        await q.message.reply_text(
+            f"👥 *Your Referral Link*\n\n`{link}`\n\n"
+            f"• They get 3 free Premium days\n"
+            f"• You get 7 free Premium days",
+            parse_mode="Markdown"
+        )
+
+    elif data == "account":
+        db = get_db()
+        row  = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+        refs = db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id=?", (uid,)).fetchone()[0]
+        db.close()
+        until = row["tier_until"][:10] if row and row["tier_until"] else "—"
+        await q.message.reply_text(
+            f"⚙️ *My Account*\n\n"
+            f"Tier: {'💎 Premium+' if tier=='premium_plus' else '⭐ Premium' if tier=='premium' else '🆓 Free'}\n"
+            f"Active until: {until}\n"
+            f"Referrals: {refs}",
+            parse_mode="Markdown"
+        )
+
+    elif data == "back":
+        await q.message.reply_text("Main menu:", reply_markup=main_menu(tier))
+
+async def on_precheckout(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.pre_checkout_query.answer(ok=True)
 
-async def successful_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    payment = update.message.successful_payment
-    log_payment(user_id, payment.total_amount, payment.currency)
-    set_premium(user_id, PREMIUM_DAYS)
+async def on_payment(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    uid     = update.effective_user.id
+    payload = update.message.successful_payment.invoice_payload
+    stars   = update.message.successful_payment.total_amount
+
+    if payload == "premium_30":
+        grant_premium(uid, "premium", 30)
+        tier_name = "Premium"
+    else:
+        grant_premium(uid, "premium_plus", 30)
+        tier_name = "Premium+"
+
+    db = get_db()
+    db.execute("UPDATE users SET stars_spent=stars_spent+? WHERE user_id=?", (stars, uid))
+    db.commit()
+    db.close()
+
     await update.message.reply_text(
-        "🎉 *Premium Activated!*\n\n"
-        "✅ 2% move alerts — live\n"
-        "✅ Whale alerts — live\n"
-        "✅ All coins tracked\n"
-        "✅ Real-time signals\n\n"
-        "You'll start receiving alerts immediately. 🚀",
-        parse_mode="Markdown"
+        f"🎉 *{tier_name} activated for 30 days!*\n\nThank you for your support!",
+        parse_mode="Markdown",
+        reply_markup=main_menu(user_tier(uid))
     )
 
-# ── Scheduled Jobs ────────────────────────────────────
-async def check_price_alerts(app: Application):
-    """Runs every 30 min. Sends alerts when coins move significantly."""
-    log.info("📡 Checking price alerts...")
-    prices = await fetch_prices(TOP_COINS)
-    if not prices:
+# ─────────────────────────────────────────────────────────────────────────────
+# SCHEDULED JOBS
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def send_channel_post(app: Application):
+    """Auto-post to public crypto channel every 4 hours."""
+    if not CHANNEL_USERNAME:
         return
+    all_prices = await get_prices(FREE_COINS)
+    fear       = await get_fear_greed()
+    trending   = await get_trending_coins()
 
-    users = get_all_users()
-    for (user_id, user_premium, threshold) in users:
-        watchlist = get_watchlist(user_id) if user_premium else TOP_COINS[:5]
-        for coin_id in watchlist:
-            data = prices.get(coin_id)
-            if not data:
-                continue
-            change = data["change_24h"]
-            direction = "up" if change > 0 else "down"
+    lines = []
+    for cid, vals in all_prices.items():
+        price  = vals.get("usd", 0)
+        change = vals.get("usd_24h_change", 0)
+        arrow  = "🟢" if change >= 0 else "🔴"
+        lines.append(f"{arrow} *{cid.upper()}*: ${price:,.4f} ({change:+.2f}%)")
 
-            if abs(change) >= (threshold or 5.0):
-                if alert_already_sent(user_id, coin_id, direction):
-                    continue
-                e = "🚀" if change > 0 else "💀"
-                msg = (
-                    f"{e} *Price Alert!*\n\n"
-                    f"*{data['name']} ({data['symbol']})* moved *{change:+.2f}%* in 24h\n"
-                    f"Current price: {format_price(data['price'])}\n"
-                    f"Volume: {format_large(data['volume'])}"
-                )
-                try:
-                    await app.bot.send_message(user_id, msg, parse_mode="Markdown")
-                    log_alert(user_id, coin_id, direction)
-                except Exception as e:
-                    log.warning(f"Alert failed for {user_id}: {e}")
-                await asyncio.sleep(0.3)
-
-async def broadcast_daily_digest(app: Application):
-    """Runs every morning at 7 AM UTC. Sends market digest."""
-    log.info("📨 Broadcasting daily crypto digest...")
-    prices  = await fetch_prices(TOP_COINS)
-    fg      = await fetch_fear_greed()
-    trending= await fetch_trending()
-    news    = await fetch_crypto_news()
-
-    if not prices:
-        return
-
-    users = get_all_users()
-    for (user_id, user_premium, _) in users:
-        try:
-            # Header
-            bar = build_fear_greed_bar(fg["value"])
-            header = (
-                f"☀️ *Good morning! Crypto Daily Digest*\n"
-                f"_{datetime.utcnow().strftime('%B %d, %Y')} — UTC_\n\n"
-                f"*Market Mood:* {bar}\n\n"
-            )
-            # Prices
-            watchlist = get_watchlist(user_id) if user_premium else TOP_COINS[:5]
-            price_section = "*📊 Prices:*\n"
-            for coin_id in watchlist:
-                if coin_id in prices:
-                    price_section += build_price_card(coin_id, prices[coin_id])
-
-            # Trending
-            trend_section = ""
-            if user_premium and trending:
-                trend_section = "\n*🔥 Trending:*\n" + "\n".join(
-                    f"• {c['name']} ({c['symbol']})" for c in trending[:3]
-                )
-
-            # News headlines
-            news_limit = 5 if user_premium else 2
-            news_section = "\n*📰 News:*\n" + "\n".join(
-                f"• [{a['title'][:60]}...]({a['url']})" for a in news[:news_limit]
-            )
-
-            full_msg = header + price_section + trend_section + news_section
-
-            await app.bot.send_message(
-                user_id, full_msg,
-                parse_mode="Markdown",
-                disable_web_page_preview=True
-            )
-            if not user_premium:
-                await app.bot.send_message(
-                    user_id,
-                    "⭐ *Upgrade to Premium* for whale alerts, all coins & 2% move triggers!",
-                    parse_mode="Markdown",
-                    reply_markup=premium_keyboard()
-                )
-            await asyncio.sleep(0.5)
-        except Exception as e:
-            log.warning(f"Digest failed for {user_id}: {e}")
-
-async def broadcast_whale_alerts(app: Application):
-    """Runs every hour. Fetches whale transactions for premium users."""
-    if not WHALE_ALERT_API_KEY:
-        return
+    trend_str = ", ".join(trending[:3]) if trending else "—"
+    msg = (
+        "📈 *Crypto Market Update*\n\n"
+        f"😱 Fear & Greed: {fear}\n"
+        f"🔥 Trending: {trend_str}\n\n"
+        + "\n".join(lines) +
+        f"\n\n👉 Get real-time alerts: @{CHANNEL_USERNAME.lstrip('@')}"
+    )
     try:
-        since = int((datetime.now() - timedelta(hours=1)).timestamp())
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(
-                WHALE_ALERT_API,
-                params={
-                    "api_key": WHALE_ALERT_API_KEY,
-                    "min_value": WHALE_THRESHOLD_USD,
-                    "start": since,
-                }
-            )
-            data = resp.json()
-            transactions = data.get("transactions", [])
+        await app.bot.send_message(CHANNEL_USERNAME, msg, parse_mode="Markdown")
     except Exception as e:
-        log.error(f"Whale Alert error: {e}")
+        log.warning(f"Crypto channel post failed: {e}")
+
+async def send_morning_digest(app: Application):
+    """Daily crypto digest at 7 AM UTC."""
+    log.info("Running crypto morning digest…")
+    db = get_db()
+    users = db.execute("SELECT user_id FROM users").fetchall()
+    db.close()
+
+    fear = await get_fear_greed()
+    trending = await get_trending_coins()
+    all_prices = await get_prices(PREMIUM_COINS)
+
+    free_lines = []
+    for cid in FREE_COINS:
+        vals = all_prices.get(cid, {})
+        price  = vals.get("usd", 0)
+        change = vals.get("usd_24h_change", 0)
+        arrow  = "🟢" if change >= 0 else "🔴"
+        free_lines.append(f"{arrow} {cid.upper()}: ${price:,.4f} ({change:+.2f}%)")
+
+    full_lines = []
+    for cid, vals in all_prices.items():
+        price  = vals.get("usd", 0)
+        change = vals.get("usd_24h_change", 0)
+        arrow  = "🟢" if change >= 0 else "🔴"
+        full_lines.append(f"{arrow} {cid.upper()}: ${price:,.4f} ({change:+.2f}%)")
+
+    for u in users:
+        uid  = u["user_id"]
+        tier = user_tier(uid)
+        lines = full_lines if tier in ("premium", "premium_plus") else free_lines
+        trend_str = ", ".join(trending[:3]) if trending else "—"
+        msg = (
+            f"☀️ *Daily Crypto Digest*\n\n"
+            f"😱 Fear & Greed: {fear}\n"
+            f"🔥 Trending: {trend_str}\n\n"
+            + "\n".join(lines)
+        )
+        try:
+            await app.bot.send_message(uid, msg, parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"Digest failed for {uid}: {e}")
+        await asyncio.sleep(0.3)
+
+async def check_price_alerts(app: Application):
+    """Check for significant price moves and alert users."""
+    all_prices = await get_prices(PREMIUM_COINS)
+    if not all_prices:
         return
 
-    if not transactions:
-        return
+    db = get_db()
+    users = db.execute("SELECT user_id FROM users").fetchall()
+    db.close()
 
-    users = get_all_users()
-    for (user_id, user_premium, _) in users:
-        if not user_premium:
-            continue
-        for tx in transactions[:5]:
-            amount_usd = tx.get("amount_usd", 0)
-            symbol = tx.get("symbol", "?").upper()
-            from_owner = tx.get("from", {}).get("owner_type", "unknown")
-            to_owner = tx.get("to", {}).get("owner_type", "unknown")
-            msg = (
-                f"🐋 *Whale Alert!*\n\n"
-                f"*{format_large(amount_usd)}* of *{symbol}* moved\n"
-                f"From: {from_owner} → To: {to_owner}\n"
-                f"_This may indicate large institutional movement._"
-            )
+    for u in users:
+        uid  = u["user_id"]
+        tier = user_tier(uid)
+
+        threshold = ALERT_PREMIUM_PLUS if tier == "premium_plus" else \
+                    ALERT_PREMIUM if tier == "premium" else ALERT_FREE
+
+        coins = PREMIUM_COINS if tier in ("premium", "premium_plus") else FREE_COINS
+        alerts = []
+        for cid in coins:
+            vals = all_prices.get(cid, {})
+            change = abs(vals.get("usd_24h_change", 0))
+            if change >= threshold:
+                price  = vals.get("usd", 0)
+                change_raw = vals.get("usd_24h_change", 0)
+                arrow  = "🟢" if change_raw >= 0 else "🔴"
+                alerts.append(f"{arrow} *{cid.upper()}* moved {change_raw:+.2f}% → ${price:,.4f}")
+
+        if alerts:
+            msg = f"🚨 *Price Alert* (>{threshold}% move)\n\n" + "\n".join(alerts)
             try:
-                await app.bot.send_message(user_id, msg, parse_mode="Markdown")
+                await app.bot.send_message(uid, msg, parse_mode="Markdown")
             except Exception as e:
-                log.warning(f"Whale alert failed for {user_id}: {e}")
-            await asyncio.sleep(0.3)
+                log.warning(f"Alert failed for {uid}: {e}")
+        await asyncio.sleep(0.3)
 
-# ── Main ──────────────────────────────────────────────
+async def check_whale_alerts(app: Application):
+    """Send whale alerts to premium users."""
+    db = get_db()
+    premium_users = db.execute(
+        "SELECT user_id, tier FROM users WHERE tier IN ('premium','premium_plus')"
+    ).fetchall()
+    db.close()
+
+    if not premium_users:
+        return
+
+    # Fetch for both thresholds
+    plus_txs    = await get_whale_alerts(WHALE_PREMIUM_PLUS)
+    premium_txs = await get_whale_alerts(WHALE_PREMIUM)
+
+    for u in premium_users:
+        uid  = u["user_id"]
+        tier = u["tier"]
+        txs  = plus_txs if tier == "premium_plus" else premium_txs
+        if not txs:
+            continue
+        lines = []
+        for tx in txs[:3]:
+            amt  = tx.get("amount_usd", 0)
+            sym  = tx.get("symbol", "?").upper()
+            lines.append(f"🐋 ${amt:,.0f} {sym}")
+        msg = "🐋 *Whale Alert*\n\n" + "\n".join(lines)
+        try:
+            await app.bot.send_message(uid, msg, parse_mode="Markdown")
+        except Exception as e:
+            log.warning(f"Whale alert failed for {uid}: {e}")
+        await asyncio.sleep(0.3)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+
 def main():
     init_db()
-    log.info("🚀 Crypto Signals Bot starting...")
+    log.info("🚀 Crypto Signals Bot starting…")
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("price",  cmd_price))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("watch",  cmd_watch))
-    app.add_handler(CommandHandler("admin",  cmd_admin))
-    app.add_handler(CallbackQueryHandler(handle_callback))
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("admin",     cmd_admin))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CallbackQueryHandler(on_callback))
+    app.add_handler(PreCheckoutQueryHandler(on_precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, on_payment))
 
     scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
-        lambda: asyncio.create_task(broadcast_daily_digest(app)),
-        "cron", hour=7, minute=0, id="daily_digest"
-    )
-    scheduler.add_job(
-        lambda: asyncio.create_task(check_price_alerts(app)),
-        "interval", minutes=30, id="price_alerts"
-    )
-    scheduler.add_job(
-        lambda: asyncio.create_task(broadcast_whale_alerts(app)),
-        "interval", hours=1, id="whale_alerts"
-    )
+    scheduler.add_job(send_morning_digest, "cron",     hour=7,  minute=0,  args=[app])
+    scheduler.add_job(check_price_alerts,  "interval", minutes=30,         args=[app])
+    scheduler.add_job(check_whale_alerts,  "interval", hours=1,            args=[app])
+    scheduler.add_job(send_channel_post,   "interval", hours=4,            args=[app])
     scheduler.start()
 
     log.info("✅ Crypto bot running. Ctrl+C to stop.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    app.run_polling(allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
 if __name__ == "__main__":
     main()
