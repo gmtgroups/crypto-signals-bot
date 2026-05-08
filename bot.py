@@ -18,10 +18,13 @@ import sqlite3
 import json
 import asyncio
 import hashlib
+import threading
 from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
+from flask import Flask, jsonify
+from flask_cors import CORS
 from telegram import (
     Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 )
@@ -672,6 +675,46 @@ async def check_whale_alerts(app: Application):
 # MAIN
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# FLASK STATS API
+# ─────────────────────────────────────────────────────────────────────────────
+
+flask_app = Flask(__name__)
+CORS(flask_app)
+
+@flask_app.route("/api/stats")
+def api_stats():
+    db = get_db()
+    total   = db.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    premium = db.execute("SELECT COUNT(*) FROM users WHERE tier='premium'").fetchone()[0]
+    plus    = db.execute("SELECT COUNT(*) FROM users WHERE tier='premium_plus'").fetchone()[0]
+    stars   = db.execute("SELECT COALESCE(SUM(stars_spent),0) FROM users").fetchone()[0]
+    refs    = db.execute("SELECT COUNT(*) FROM referrals").fetchone()[0]
+    today   = db.execute(
+        "SELECT COUNT(*) FROM users WHERE date(joined_at)=date('now')"
+    ).fetchone()[0]
+    db.close()
+    return jsonify({
+        "bot": "Crypto Signals Pro",
+        "total_users": total,
+        "free_users": total - premium - plus,
+        "premium_users": premium,
+        "premium_plus_users": plus,
+        "stars_earned": stars,
+        "usd_earned": round(stars * 0.0125, 2),
+        "referrals": refs,
+        "new_today": today,
+        "updated_at": datetime.utcnow().isoformat()
+    })
+
+@flask_app.route("/health")
+def health():
+    return jsonify({"status": "ok", "bot": "crypto-signals"})
+
+def run_flask():
+    port = int(os.environ.get("PORT", 8081))
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+
 def main():
     init_db()
     log.info("🚀 Crypto Signals Bot starting…")
@@ -692,6 +735,9 @@ def main():
     scheduler.add_job(send_channel_post,   "interval", hours=4,            args=[app])
     scheduler.start()
 
+    # Start Flask stats API in background thread
+    t = threading.Thread(target=run_flask, daemon=True)
+    t.start()
     log.info("✅ Crypto bot running. Ctrl+C to stop.")
     app.run_polling(allowed_updates=["message", "callback_query", "pre_checkout_query"])
 
